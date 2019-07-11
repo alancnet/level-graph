@@ -1,3 +1,7 @@
+const level = require('level-sugar')
+const { from } = require('rxjs')
+const { filter, map, flatMap, flat, toArray, distinct } = require('rxjs/operators')
+
 const _ = require('lodash')
 const uuid = require('uuid')
 const RID = '@rid'
@@ -70,35 +74,28 @@ const identity = x => x
 const truthy = x => !!x
 
 class Graph {
-  constructor (data) {
-    this.vertices = data && data.vertices || []
-    this.edges = data && data.edges || []
-    this.nodes = {}
-    this.vertices.forEach(v => this.register(v))
-    this.edges.forEach(e => this.register(e))
+  constructor (...levelArgs) {
+    this.level = level(...levelArgs)
+    // this.vertices = data && data.vertices || []
+    // this.edges = data && data.edges || []
+    // this.nodes = {}
+    // this.vertices.forEach(v => this.register(v))
+    // this.edges.forEach(e => this.register(e))
   }
-  clone () {
-    return new Graph({
-      vertices: _.cloneDeep(this.vertices),
-      edges: _.cloneDeep(this.edges)
-    })
-  }
-  register (node) {
+  async register (node) {
     assertIsNode(node)
-    if (this.nodes.hasOwnProperty(node[RID])) {
-      throw new Error(`Duplicate @rid: ${node[RID]}`)
-    }
-    this.nodes[node[RID]] = node
+    if (isVertex(node)) this.level.vertices.put(node[RID], node)
+    else if (isEdge(node)) this.level.edges.put(node[RID], node)
+    else throw new Error(`Unexpected type: ${node[TYPE]}`)
   }
-  addVertex (obj) {
+  async addVertex (obj) {
     const vertex = Object.assign({[RID]: uuid(), [TYPE]: VERTEX}, obj)
-    this.register(vertex)
-    this.vertices.push(vertex)
+    await this.register(vertex)
     return new Traversal(this, this.v, [vertex])
   }
-  addEdge (outV, inV, label, obj) {
-    outV = singleVertex(outV)
-    inV = singleVertex(inV)
+  async addEdge (outV, inV, label, obj) {
+    outV = await singleVertex(outV)
+    inV = await singleVertex(inV)
     assertIsLabel(label)
     const edge = Object.assign(
       {[RID]: uuid(), [TYPE]: EDGE},
@@ -109,92 +106,107 @@ class Graph {
         label
       }
     )
-    this.register(edge)
+    await this.register(edge)
     const ok = outKey(label)
     const ik = inKey(label)
     if (!outV[ok]) outV[ok] = []
     if (!inV[ik]) inV[ik] = []
     outV[ok].push(edge[RID])
     inV[ik].push(edge[RID])
-    this.edges.push(edge)
+    await this.register(outV)
+    await this.register(inV)
     return new Traversal(this, this.v, [edge])
   }
-  remove (node) {
-    if (node[TYPE] === VERTEX) {
-      flatten(
-        Object.keys(node)
-          .filter(k => k.startsWith('out_') || k.startsWith('in_'))
-          .map(k => node[k])
-      )
-        .map(rid => this.nodes[rid])
-        .forEach(e => this.remove(e))
-
-      const removed = filterArray(this.vertices, v => v === node)
-      if (removed !== 1) throw new Error(`Expected 1 item to be deleted. Got ${removed}.`)
-      delete this.nodes[node[RID]]
+  async remove (node) {
+    // if () await this.level.vertices.del(node[RID])
+    // else if (isEdge(node)) await this.level.edges.del(node[RID])
+    if (isVertex(node)) {
+      for (let key in node) {
+        if (key.startsWith('out_')) {
+          for (let fk of node[key]) {
+            const edge = await this.level.edges.get(fk)
+            const vertex = await this.vertices.get(edge.in)
+            filterArray(vertex[inKey(edge.label)], k => k === node[RID])
+            await this.level.edges.del(edge[RID])
+            await this.register(vertex)
+          }
+        }
+        if (key.startsWith('in_')) {
+          for (let fk of node[key]) {
+            const edge = await this.level.edges.get(fk)
+            const vertex = await this.vertices.get(edge.out)
+            filterArray(vertex[inKey(edge.label)], k => k === node[RID])
+            await this.level.edges.del(edge[RID])
+            await this.register(vertex)
+          }
+        }
+      }
+      await this.level.vertices.del(node[RID])
     } else if (node[TYPE] === EDGE) {
-      const outV = this.nodes[node.out]
-      const inV = this.nodes[node.in]
+      const outV = await this.level.vertices.get(node.out)
+      const inV = await this.level.vertices.get(node.in)
       const ok = outKey(node.label)
       const ik = inKey(node.label)
       filterArray(outV[ok], k => k === node[RID])
       filterArray(inV[ik], k => k === node[RID])
       filterArray(this.edges, e => e === node)
-      delete this.nodes[node[RID]]
+      await this.register(outV)
+      await this.register(inV)
+      await this.edges.del(node[RID])
     }
   }
   v (rid) {
     if (rid && rid[RID]) rid = rid[RID]
     if (rid) {
-      return new Traversal(this, null, [this.nodes[rid]]
-        .filter(identity).filter(x => x[TYPE] === VERTEX))
+      const rids = Array.isArray(rid) ? rid : [rid]
+      return new Traversal(this, null, from(rids).pipe(distinct(), filter(identity), flatMap(rid => this.level.vertices.get(rid)), filter(identity)))
     } else {
-      return new Traversal(this, null, this.vertices)
+      return new Traversal(this, null, this.level.vertices.stream.pipe(map(x => x.value)))
     }
   }
   e (rid) {
     if (rid && rid[RID]) rid = rid[RID]
     if (rid) {
-      return new Traversal(this, null, [this.nodes[rid]]
-        .filter(identity).filter(x => x[TYPE] === EDGE))
+      const rids = Array.isArray(rid) ? rid : [rid]
+      return new Traversal(this, null, from(rids).pipe(distinct(), filter(identity), flatMap(rid => this.level.edges.get(rid)), filter(identity)))
     } else {
-      return new Traversal(this, null, this.vertices)
+      return new Traversal(this, null, this.level.edges.stream.pipe(map(x => x.value)))
     }
   }
-  manifest (VertexClass, EdgeClass) {
-    if (!VertexClass) VertexClass = Object
-    if (!EdgeClass) EdgeClass = Object
-    const nodes = _.cloneDeep(this.nodes)
-    this.vertices.map(v => v[RID])
-      .forEach(rid => (
-        nodes[rid] = Object.assign(new VertexClass(nodes[rid]), nodes[rid])
-      ))
-    this.edges.map(v => v[RID])
-      .forEach(rid => (
-        nodes[rid] = Object.assign(new EdgeClass(nodes[rid]), nodes[rid])
-      ))
-    const vertices = this.vertices.map(v => nodes[v[RID]])
-    const edges = this.edges.map(e => nodes[e[RID]])
-    vertices.forEach(v => Object.keys(v).forEach(key => {
-      if (key.startsWith('out_') || key.startsWith('in_')) {
-        const arr = v[key]
-        arr.forEach((x, i) => {
-          arr[i] = nodes[x]
-        })
-      }
-    }))
-    edges.forEach(e => {
-      e.out = nodes[e.out]
-      e.in = nodes[e.in]
-    })
-    return {vertices, edges}
-  }
-  export () {
-    return {
-      vertices: _.cloneDeep(this.vertices),
-      edges: _.cloneDeep(this.edges)
-    }
-  }
+  // manifest (VertexClass, EdgeClass) {
+  //   if (!VertexClass) VertexClass = Object
+  //   if (!EdgeClass) EdgeClass = Object
+  //   const nodes = _.cloneDeep(this.nodes)
+  //   this.vertices.map(v => v[RID])
+  //     .forEach(rid => (
+  //       nodes[rid] = Object.assign(new VertexClass(nodes[rid]), nodes[rid])
+  //     ))
+  //   this.edges.map(v => v[RID])
+  //     .forEach(rid => (
+  //       nodes[rid] = Object.assign(new EdgeClass(nodes[rid]), nodes[rid])
+  //     ))
+  //   const vertices = this.vertices.map(v => nodes[v[RID]])
+  //   const edges = this.edges.map(e => nodes[e[RID]])
+  //   vertices.forEach(v => Object.keys(v).forEach(key => {
+  //     if (key.startsWith('out_') || key.startsWith('in_')) {
+  //       const arr = v[key]
+  //       arr.forEach((x, i) => {
+  //         arr[i] = nodes[x]
+  //       })
+  //     }
+  //   }))
+  //   edges.forEach(e => {
+  //     e.out = nodes[e.out]
+  //     e.in = nodes[e.in]
+  //   })
+  //   return {vertices, edges}
+  // }
+  // export () {
+  //   return {
+  //     vertices: _.cloneDeep(this.vertices),
+  //     edges: _.cloneDeep(this.edges)
+  //   }
+  // }
 }
 
 class Traversal {
@@ -204,8 +216,8 @@ class Traversal {
     this.nodes = nodes
     this.name = null
   }
-  _next (nodes) {
-    return new Traversal(this.graph, this, nodes || this.nodes)
+  _next (...operators) {
+    return new Traversal(this.graph, this, this.nodes.pipe(...operators))
   }
   addEdge (label, other, obj) {
     assertIsTraversal(other)
@@ -220,44 +232,44 @@ class Traversal {
   }
   has (obj) {
     const matcher = _.matches(obj)
-    return this._next(this.nodes.filter(matcher))
+    return this._next(filter(matcher))
   }
   hasNot (obj) {
     const matcher = _.matches(obj)
-    return this._next(this.nodes.filter(n => !matcher(n)))
+    return this._next(filter(n => !matcher(n)))
   }
   outE (label) {
     const key = outKey(label)
     return this._next(
-      flatten(
-        this.nodes
-        .map(n => n[key] || [])
-      )
-      .map(rid => this.graph.nodes[rid])
+      flatMap(n => n[key]),
+      toArray(),
+      flatMap(rids => this.graph.e(rids).toArray()),
+      flatMap(identity)
     )
   }
   inE (label) {
     const key = inKey(label)
     return this._next(
-      flatten(
-        this.nodes
-        .map(n => n[key] || [])
-      )
-      .map(rid => this.graph.nodes[rid])
+      flatMap(n => n[key]),
+      toArray(),
+      flatMap(rids => this.graph.e(rids).toArray()),
+      flatMap(identity)
     )
   }
   outV () {
     return this._next(
-      this.nodes.map(n => n.out)
-        .filter(truthy)
-        .map(rid => this.graph.nodes[rid])
+      map(n => n.out),
+      toArray(),
+      flatMap(rids => this.graph.v(rids).toArray()),
+      flatMap(identity)
     )
   }
   inV () {
     return this._next(
-      this.nodes.map(n => n.in)
-        .filter(truthy)
-        .map(rid => this.graph.nodes[rid])
+      map(n => n.in),
+      toArray(),
+      flatMap(rids => this.graph.v(rids).toArray()),
+      flatMap(identity)
     )
   }
   out (label) {
@@ -292,14 +304,14 @@ class Traversal {
       )
     )
   }
-  or (conditions) {
-    return this._boolean((a, b) => a || b, false, Array.from(arguments))
+  or (...conditions) {
+    return this._boolean((a, b) => a || b, false, conditions)
   }
-  and (conditions) {
-    return this._boolean((a, b) => a && b, true, Array.from(arguments))
+  and (...conditions) {
+    return this._boolean((a, b) => a && b, true, conditions)
   }
-  except (conditions) {
-    return this._boolean((a, b) => a && !b, true, Array.from(arguments))
+  except (...conditions) {
+    return this._boolean((a, b) => a && !b, true, conditions)
   }
   retain (conditions) {
     return this.and(merge(this, conditions))
@@ -351,7 +363,11 @@ class Traversal {
     return this._next([named])
   }
   toArray () {
-    return this.nodes.slice()
+    return new Promise((resolve, reject) => {
+      this.nodes.pipe(
+        toArray()
+      ).subscribe(resolve, reject, reject)
+    })
   }
   first () {
     return this.nodes[0] || null
